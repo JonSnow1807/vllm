@@ -1291,11 +1291,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             logit_index = struct_out_req_batch_indices[req_id]
             num_spec_tokens = len(
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id, []))
-            for i in range(1 + num_spec_tokens):
-                sorted_bitmask[logit_index + i] = \
-                    grammar_bitmask[cumulative_index + i]
-                out_indices.append(logit_index + i)
-            cumulative_index += 1 + num_spec_tokens
+            tokens_count = 1 + num_spec_tokens
+            # OPTIMIZATION: Vectorized copy instead of element-by-element
+            sorted_bitmask[logit_index:logit_index + tokens_count] = \
+                grammar_bitmask[cumulative_index:cumulative_index + tokens_count]
+            out_indices.extend(range(logit_index, logit_index + tokens_count))
+            cumulative_index += tokens_count
         grammar_bitmask = sorted_bitmask
 
         # If the grammar bitmask and the logits have the same shape
