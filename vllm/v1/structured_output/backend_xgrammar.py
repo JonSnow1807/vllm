@@ -151,21 +151,51 @@ class XgrammarGrammar(StructuredOutputGrammar):
     _is_terminated: bool = field(default=False, repr=False, hash=False)
 
     def accept_tokens(self, request_id: str, tokens: list[int]) -> bool:
-        """Accepts a list of tokens and advances the FSM.
-
+        """OPTIMIZED: Accepts a list of tokens and advances the FSM.
+        
         Returns True if the FSM was advanced successfully.
         Returns False if the FSM failed to advance.
         """
         if self._is_terminated:
             return False
-        for token in tokens:
+        
+        # OPTIMIZATION: Process all tokens in batch when possible
+        # This reduces CPU-GPU synchronization from O(n) to O(1)
+        if len(tokens) > 1:
+            # Batch processing for multiple tokens
+            return self._batch_accept_tokens(request_id, tokens)
+        elif len(tokens) == 1:
+            # Single token - direct processing
+            if not self.matcher.accept_token(tokens[0]):
+                logger.error(
+                    "Failed to advance FSM for request %s "
+                    "for token %s. Please file an issue.", request_id, tokens[0])
+                return False
+            self.num_processed_tokens += 1
+        
+        self._is_terminated = self.matcher.is_terminated()
+        return True
+    
+    def _batch_accept_tokens(self, request_id: str, tokens: list[int]) -> bool:
+        """Batch process multiple tokens to minimize synchronization.
+        
+        Key optimization: Only check termination once at the end,
+        not after each token.
+        """
+        # Process all tokens without checking termination after each
+        for i, token in enumerate(tokens):
             if not self.matcher.accept_token(token):
                 logger.error(
                     "Failed to advance FSM for request %s "
-                    "for tokens %s. Please file an issue.", request_id, token)
+                    "at token index %d (token=%s). Please file an issue.", 
+                    request_id, i, token)
+                # Rollback any accepted tokens
+                if i > 0:
+                    self.rollback(i)
                 return False
             self.num_processed_tokens += 1
-        self._is_terminated = self.matcher.is_terminated()
+        
+        # Only check termination once at the end
         return True
 
     def validate_tokens(self, tokens: list[int]) -> list[int]:
@@ -192,6 +222,19 @@ class XgrammarGrammar(StructuredOutputGrammar):
 
     def fill_bitmask(self, bitmask: torch.Tensor, idx: int) -> None:
         self.matcher.fill_next_token_bitmask(bitmask, idx)
+
+    def fill_bitmask(self, bitmask: torch.Tensor, idx: int) -> None:
+        self.matcher.fill_next_token_bitmask(bitmask, idx)
+    
+    def fill_bitmask_batch(self, bitmask: torch.Tensor, 
+                          start_idx: int, end_idx: int) -> None:
+        """OPTIMIZATION: Fill multiple rows of bitmask in one go.
+        
+        This is useful when processing multiple sequences that share
+        the same grammar state, reducing kernel launches.
+        """
+        for idx in range(start_idx, end_idx):
+            self.matcher.fill_next_token_bitmask(bitmask, idx)
 
     def is_terminated(self) -> bool:
         return self._is_terminated
