@@ -12,6 +12,7 @@ try:
     from vllm.vllm_flash_attn import (
         fa_version_unsupported_reason,
         flash_attn_varlen_func,
+        get_scheduler_metadata,
         is_fa_version_supported,
     )
 except ImportError:
@@ -215,6 +216,154 @@ def test_varlen_with_paged_kv(
         torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol),
         f"{torch.max(torch.abs(output - ref_output))}",
     )
+
+
+@pytest.mark.parametrize(
+    "batch_size, num_tokens, query_len, context_len",
+    [
+        # Mixed FULL graph at max_num_seqs=16 replayed by one 161-token prefill.
+        (16, 168, 161, 2048),
+        # 2-token graph replayed by two new tokens on a prefix-cache hit.
+        (2, 2, 2, 128),
+    ],
+)
+@pytest.mark.parametrize("num_heads", [(32, 8), (8, 1)])
+@torch.inference_mode()
+def test_fa3_split_kv_combine_cudagraph_replay(
+    batch_size: int,
+    num_tokens: int,
+    query_len: int,
+    context_len: int,
+    num_heads: tuple[int, int],
+) -> None:
+    """Replaying a FULL cudagraph must combine every split-KV row.
+
+    FA3 picks the split-KV combine kernel's grid on the host from max_seqlen_q
+    and the graph freezes it. The graph is captured on a dummy batch of
+    ``batch_size`` requests sharing ``num_tokens`` and replayed on a single
+    ``query_len``-token request, which shares only the padded sizes with the
+    captured batch (vllm-project/vllm#62626).
+    """
+    if not is_fa_version_supported(3):
+        pytest.skip(f'FA3 unsupported: "{fa_version_unsupported_reason(3)}"')
+    torch.set_default_device("cuda")
+    set_random_seed(0)
+
+    num_query_heads, num_kv_heads = num_heads
+    head_size = 128
+    block_size = 16
+    dtype = torch.bfloat16
+    scale = head_size**-0.5
+    # Default of flash_attn_max_num_splits_for_cuda_graph.
+    max_num_splits = 32
+    # vLLM captures with max_seqlen_k = max_model_len.
+    max_seqlen_k = 4096
+    num_blocks = 1024
+
+    # Dummy batch as InputBatch.make_dummy builds it without a max_query_len
+    # bound: seq_len == query_len, the remainder spread over the last requests.
+    base, extra = divmod(num_tokens, batch_size)
+    dummy_lens = [base] * (batch_size - extra) + [base + 1] * extra
+    dummy_max_seqlen_q = max(dummy_lens)
+    kv_len = context_len + query_len
+
+    # Persistent buffers; replay only changes their contents.
+    query = torch.zeros(num_tokens, num_query_heads, head_size, dtype=dtype)
+    out = torch.zeros_like(query)
+    cu_seqlens_q = torch.zeros(batch_size + 1, dtype=torch.int32)
+    seqused_k = torch.zeros(batch_size, dtype=torch.int32)
+    block_table = torch.zeros(batch_size, max_seqlen_k // block_size, dtype=torch.int32)
+    key_cache = torch.randn(
+        num_blocks, block_size, num_kv_heads, head_size, dtype=dtype
+    )
+    value_cache = torch.randn_like(key_cache)
+
+    def build_scheduler_metadata(max_seqlen_q: int) -> torch.Tensor:
+        return get_scheduler_metadata(
+            batch_size=batch_size,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            num_heads_q=num_query_heads,
+            num_heads_kv=num_kv_heads,
+            headdim=head_size,
+            cache_seqlens=seqused_k,
+            qkv_dtype=dtype,
+            cu_seqlens_q=cu_seqlens_q,
+            page_size=block_size,
+            causal=True,
+            num_splits=max_num_splits,
+        )
+
+    def attention(max_seqlen_q: int, scheduler_metadata: torch.Tensor) -> None:
+        flash_attn_varlen_func(
+            q=query,
+            k=key_cache,
+            v=value_cache,
+            out=out,
+            cu_seqlens_q=cu_seqlens_q,
+            seqused_k=seqused_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=scale,
+            causal=True,
+            block_table=block_table,
+            scheduler_metadata=scheduler_metadata,
+            num_splits=max_num_splits,
+            fa_version=3,
+        )
+
+    cu_seqlens_q[1:] = torch.tensor(dummy_lens, dtype=torch.int32).cumsum(0)
+    seqused_k.copy_(torch.tensor(dummy_lens, dtype=torch.int32))
+    scheduler_metadata = build_scheduler_metadata(dummy_max_seqlen_q)
+    attention(dummy_max_seqlen_q, scheduler_metadata)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        attention(dummy_max_seqlen_q, scheduler_metadata)
+
+    # Real batch: one request, the rest zero-length padding.
+    query[:query_len].normal_()
+    cu_seqlens_q[1:] = query_len
+    seqused_k.zero_()
+    seqused_k[0] = kv_len
+    num_kv_blocks = (kv_len + block_size - 1) // block_size
+    block_table[0, :num_kv_blocks] = torch.randperm(num_blocks)[:num_kv_blocks].int()
+    replay_metadata = build_scheduler_metadata(query_len)
+    assert replay_metadata.shape == scheduler_metadata.shape
+    # The metadata holds vectors of round_up(batch_size, 4) entries, the second
+    # being the split count chosen per request (hopper/flash_api.cpp); the
+    # combine kernel only runs for the real request if its KV range was split,
+    # which the heuristic does on a full Hopper part but not on a small
+    # partition (few SMs).
+    num_splits = replay_metadata[(batch_size + 3) // 4 * 4].item()
+    if num_splits <= 1:
+        pytest.skip(f"FA3 did not split the KV range on this device ({num_splits=})")
+    scheduler_metadata.copy_(replay_metadata)
+
+    out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    graph_out = out[:query_len].clone()
+
+    out.fill_(float("nan"))
+    attention(query_len, replay_metadata)
+    eager_out = out[:query_len].clone()
+
+    ref_out = ref_paged_attn(
+        query=query[:query_len].clone(),
+        key_cache=key_cache,
+        value_cache=value_cache,
+        query_lens=[query_len],
+        kv_lens=[kv_len],
+        block_tables=block_table[:1],
+        scale=scale,
+    )
+    num_uncombined = graph_out.isnan().any(dim=-1).sum().item()
+    assert num_uncombined == 0, (
+        f"{num_uncombined} of {query_len * num_query_heads} (token, head) rows "
+        "were never combined by the replayed graph"
+    )
+    torch.testing.assert_close(graph_out, eager_out, atol=1.5e-2, rtol=1e-2)
+    torch.testing.assert_close(graph_out, ref_out, atol=1.5e-2, rtol=1e-2)
 
 
 @pytest.mark.skipif(
